@@ -906,6 +906,7 @@ room-<unique room ID>: {
 	"secret" : "<room management password; optional, if provided the user is an admin and can't be globally muted with mute_room>",
 	"audio_level_average" : "<if provided, overrides the room audio_level_average for this user; optional>",
 	"audio_active_packets" : "<if provided, overrides the room audio_active_packets for this user; optional>",
+	"meter_events" : "<true|false, whether to report audio levels for all participants in regular events>",
 	"record": <true|false, whether to record this user's contribution to a .mjr file (mixer not involved)>,
 	"filename": "<basename of the file to record to, -audio.mjr will be added by the plugin; will be relative to mjrs_dir, if configured in the room>"
 }
@@ -1229,6 +1230,7 @@ room-<unique room ID>: {
 #include <netdb.h>
 #include <sys/time.h>
 #include <poll.h>
+#include <math.h>
 
 #include "../debug.h"
 #include "../apierror.h"
@@ -1361,6 +1363,7 @@ static struct janus_json_parameter create_parameters[] = {
 	{"permanent", JANUS_JSON_BOOL, 0},
 	{"audiolevel_ext", JANUS_JSON_BOOL, 0},
 	{"audiolevel_event", JANUS_JSON_BOOL, 0},
+	{"meter_interval", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"audio_active_packets", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"audio_level_average", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"default_expectedloss", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
@@ -1409,6 +1412,7 @@ static struct janus_json_parameter join_parameters[] = {
 	{"record", JANUS_JSON_BOOL, 0},
 	{"filename", JSON_STRING, 0},
 	{"generate_offer", JANUS_JSON_BOOL, 0},
+	{"meter_events", JANUS_JSON_BOOL, 0},
 	{"rtp", JSON_OBJECT, 0},
 	{"secret", JSON_STRING, 0}
 };
@@ -1532,6 +1536,7 @@ typedef struct janus_audiobridge_room {
 	gboolean spatial_audio;		/* Whether the mix will use spatial audio, using stereo */
 	gboolean audiolevel_ext;	/* Whether the ssrc-audio-level extension must be negotiated or not for new joins */
 	gboolean audiolevel_event;	/* Whether to emit event to other users about audiolevel */
+	uint meter_interval;
 	uint default_expectedloss;	/* Percent of packets we expect participants may miss, to help with outgoing FEC: can be overridden per-participant */
 	int32_t default_bitrate;	/* Default bitrate to use for all Opus streams when encoding */
 	int audio_active_packets;	/* Amount of packets with audio level for checkup */
@@ -1773,6 +1778,11 @@ typedef struct janus_audiobridge_participant {
 	int opus_complexity;	/* Complexity to use in the encoder (by default, DEFAULT_COMPLEXITY) */
 	gboolean stereo;		/* Whether stereo will be used for spatial audio */
 	int spatial_position;	/* Panning of this participant in the mix */
+
+	/* Audio metering stuff */
+	double meter_sum;
+	unsigned int meter_samples;
+	gboolean meter_events;
 #ifdef HAVE_RNNOISE
 #define DENOISER_FRAME_SIZE 480
 	gboolean denoise;					/* Whether we should denoise this participant */
@@ -1970,6 +1980,8 @@ static void janus_audiobridge_participant_denoise(janus_audiobridge_participant 
 static void janus_audiobridge_participant_upsample(janus_audiobridge_participant *participant, opus_int16 *input, int *in_len, opus_int16 *output, int *out_len);
 static void janus_audiobridge_participant_downsample(janus_audiobridge_participant *participant, opus_int16 *input, int *in_len, opus_int16 *output, int *out_len);
 #endif
+
+static void janus_audiobridge_meter_audio(janus_audiobridge_participant *participant, char *data, int len);
 
 static void janus_audiobridge_session_destroy(janus_audiobridge_session *session) {
 	if(session && g_atomic_int_compare_and_exchange(&session->destroyed, 0, 1))
@@ -2676,6 +2688,7 @@ int janus_audiobridge_init(janus_callbacks *callback, const char *config_path) {
 			janus_config_item *spatial = janus_config_get(config, cat, janus_config_type_item, "spatial_audio");
 			janus_config_item *audiolevel_ext = janus_config_get(config, cat, janus_config_type_item, "audiolevel_ext");
 			janus_config_item *audiolevel_event = janus_config_get(config, cat, janus_config_type_item, "audiolevel_event");
+			janus_config_item *meter_interval = janus_config_get(config, cat, janus_config_type_item, "meter_interval");
 			janus_config_item *audio_active_packets = janus_config_get(config, cat, janus_config_type_item, "audio_active_packets");
 			janus_config_item *audio_level_average = janus_config_get(config, cat, janus_config_type_item, "audio_level_average");
 			janus_config_item *default_expectedloss = janus_config_get(config, cat, janus_config_type_item, "default_expectedloss");
@@ -2761,6 +2774,14 @@ int janus_audiobridge_init(janus_callbacks *callback, const char *config_path) {
 			audiobridge->audiolevel_event = FALSE;
 			if(audiolevel_event != NULL && audiolevel_event->value != NULL)
 				audiobridge->audiolevel_event = janus_is_true(audiolevel_event->value);
+			audiobridge->meter_interval = 0;
+			if(meter_interval != NULL && meter_interval->value != NULL){
+				if(atoi(meter_interval->value) >= 0) {
+					audiobridge->meter_interval = atoi(meter_interval->value);
+				} else {
+					JANUS_LOG(LOG_WARN, "Invalid meter_interval value provided, using default: %d\n", audiobridge->meter_interval);
+				}
+			}
 			if(audiobridge->audiolevel_event) {
 				audiobridge->audio_active_packets = 100;
 				if(audio_active_packets != NULL && audio_active_packets->value != NULL){
@@ -3274,6 +3295,7 @@ static json_t *janus_audiobridge_process_synchronous_request(janus_audiobridge_s
 		json_t *spatial = json_object_get(root, "spatial_audio");
 		json_t *audiolevel_ext = json_object_get(root, "audiolevel_ext");
 		json_t *audiolevel_event = json_object_get(root, "audiolevel_event");
+		json_t *meter_interval = json_object_get(root, "meter_interval");
 		json_t *audio_active_packets = json_object_get(root, "audio_active_packets");
 		json_t *audio_level_average = json_object_get(root, "audio_level_average");
 		json_t *default_expectedloss = json_object_get(root, "default_expectedloss");
@@ -3413,6 +3435,13 @@ static json_t *janus_audiobridge_process_synchronous_request(janus_audiobridge_s
 		audiobridge->spatial_audio = spatial ? json_is_true(spatial) : FALSE;
 		audiobridge->audiolevel_ext = audiolevel_ext ? json_is_true(audiolevel_ext) : TRUE;
 		audiobridge->audiolevel_event = audiolevel_event ? json_is_true(audiolevel_event) : FALSE;
+		audiobridge->meter_interval = 0;
+		if(json_integer_value(meter_interval) >= 0) {
+			audiobridge->meter_interval = json_integer_value(meter_interval);
+		} else {
+			JANUS_LOG(LOG_WARN, "Invalid meter_interval value provided, using default: %d\n",
+				  audiobridge->meter_interval);
+		}
 		if(audiobridge->audiolevel_event) {
 			audiobridge->audio_active_packets = 100;
 			if(json_integer_value(audio_active_packets) > 0) {
@@ -3598,6 +3627,8 @@ static json_t *janus_audiobridge_process_synchronous_request(janus_audiobridge_s
 				janus_config_add(config, c, janus_config_item_create("pin", audiobridge->room_pin));
 			if(audiobridge->signed_tokens)
 				janus_config_add(config, c, janus_config_item_create("signed_tokens", "true"));
+			g_snprintf(value, BUFSIZ, "%d", audiobridge->meter_interval);
+			janus_config_add(config, c, janus_config_item_create("meter_interval", value));
 			if(audiobridge->audiolevel_ext) {
 				janus_config_add(config, c, janus_config_item_create("audiolevel_ext", "true"));
 				if(audiobridge->audiolevel_event)
@@ -3781,6 +3812,8 @@ static json_t *janus_audiobridge_process_synchronous_request(janus_audiobridge_s
 				janus_config_add(config, c, janus_config_item_create("pin", audiobridge->room_pin));
 			if(audiobridge->signed_tokens)
 				janus_config_add(config, c, janus_config_item_create("signed_tokens", "true"));
+			g_snprintf(value, BUFSIZ, "%d", audiobridge->meter_interval);
+			janus_config_add(config, c, janus_config_item_create("meter_interval", value));
 			if(audiobridge->audiolevel_ext) {
 				janus_config_add(config, c, janus_config_item_create("audiolevel_ext", "true"));
 				if(audiobridge->audiolevel_event)
@@ -6822,6 +6855,7 @@ static void *janus_audiobridge_handler(void *data) {
 			json_t *record = json_object_get(root, "record");
 			json_t *recfile = json_object_get(root, "filename");
 			json_t *gen_offer = json_object_get(root, "generate_offer");
+			json_t *meter_events = json_object_get(root, "meter_events");
 			int volume = gain ? json_integer_value(gain) : 100;
 			int spatial_position = spatial ? json_integer_value(spatial) : 50;
 			int32_t opus_bitrate = audiobridge->default_bitrate;
@@ -6958,6 +6992,7 @@ static void *janus_audiobridge_handler(void *data) {
 			participant->admin = admin;
 			participant->display = display_text ? g_strdup(display_text) : NULL;
 			participant->muted = muted ? json_is_true(muted) : FALSE;	/* By default, everyone's unmuted when joining */
+			participant->meter_events = meter_events ? json_is_true(meter_events) : FALSE;
 			if(suspended && json_is_true(suspended)) {
 				janus_mutex_lock(&participant->suspend_cond_mutex);
 				g_atomic_int_set(&participant->suspended, 1);
@@ -9251,6 +9286,9 @@ static void *janus_audiobridge_participant_thread(void *data) {
 						if(participant->denoise)
 							janus_audiobridge_participant_denoise(participant, (char *)pkt->data, pkt->length);
 #endif
+						/* Perform metering on the decoded audio */
+						janus_audiobridge_meter_audio(participant, (char*)pkt->data, pkt->length);
+
 						/* Update the details */
 						participant->last_seq = pkt->seq_number;
 						participant->last_timestamp = pkt->timestamp;
@@ -9339,6 +9377,9 @@ static void *janus_audiobridge_participant_thread(void *data) {
 					if(participant->denoise)
 						janus_audiobridge_participant_denoise(participant, (char *)pkt->data, pkt->length);
 #endif
+					/* Perform metering on the decoded audio */
+					janus_audiobridge_meter_audio(participant, (char*)pkt->data, pkt->length);
+
 					/* Get rid of the buffered packet */
 					janus_audiobridge_buffer_packet_destroy(bpkt);
 					/* Update the details */
@@ -9763,6 +9804,55 @@ static void janus_audiobridge_participant_istalking(janus_audiobridge_session *s
 				janus_mutex_unlock(&audiobridge->mutex);
 			}
 		}
+	}
+}
+
+static void janus_audiobridge_meter_audio(janus_audiobridge_participant *participant, char *data, int len) {
+	if(len < 0 || data == NULL || participant == NULL || participant->room == NULL)
+		return;
+	janus_audiobridge_room *audiobridge = participant->room;
+	if (audiobridge->meter_interval == 0)
+		return;
+
+	// accumulate audio samples
+	opus_int16 *samples = (opus_int16 *)data;
+	unsigned int num_samples = len;
+	double sum = 0.0;
+	for (unsigned int i = 0; i < num_samples; i++) {
+		double sample = (double)samples[i] / (1<<15);
+		sum += (sample * sample);
+	}
+	participant->meter_sum += sum;
+	participant->meter_samples += num_samples;
+
+	// once the metering interval has expired, emit events
+	if (participant->meter_samples >= audiobridge->meter_interval) {
+		double rms = sqrt(participant->meter_sum / participant->meter_samples);
+		double dbfs = rms == 0 ? -INFINITY : log10(rms) * 20;
+		participant->meter_samples = 0;
+		participant->meter_sum = 0;
+
+		janus_mutex_lock(&audiobridge->mutex);
+		json_t *event = json_object();
+		double val = (double)((int)round(dbfs * 10)) / 10;
+		json_object_set_new(event, "audiobridge", json_string("level"));
+		json_object_set_new(event, "level", json_real(val));;
+		json_object_set_new(event, "room",
+				    string_ids ? json_string(audiobridge->room_id_str) : json_integer(audiobridge->room_id));
+		json_object_set_new(event, "id",
+				    string_ids ? json_string(participant->user_id_str) : json_integer(participant->user_id));
+
+		GHashTableIter iter;
+		gpointer value;
+		g_hash_table_iter_init(&iter, audiobridge->participants);
+		while(g_hash_table_iter_next(&iter, NULL, &value)) {
+			janus_audiobridge_participant *p = value;
+			if(!p->meter_events || g_atomic_int_get(&p->paused_events))
+				continue;
+			 gateway->push_event(p->session->handle, &janus_audiobridge_plugin, NULL, event, NULL);
+		}
+		json_decref(event);
+		janus_mutex_unlock(&audiobridge->mutex);
 	}
 }
 
