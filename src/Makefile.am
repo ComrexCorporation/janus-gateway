@@ -399,7 +399,11 @@ plugin_LTLIBRARIES += plugins/libjanus_audiobridge.la
 plugins_libjanus_audiobridge_la_SOURCES = plugins/janus_audiobridge.c \
 	plugins/audiobridge-deps/jitter.c plugins/audiobridge-deps/resample.c plugins/audiobridge-deps/arch.h \
 	plugins/audiobridge-deps/os_support.h plugins/audiobridge-deps/speex/speex_jitter.h plugins/audiobridge-deps/speex/speex_resampler.h \
-	plugins/audiobridge-deps/speex/speexdsp_types.h plugins/audiobridge-deps/speex/speexdsp_config_types.h
+	plugins/audiobridge-deps/speex/speexdsp_types.h plugins/audiobridge-deps/speex/speexdsp_config_types.h \
+	plugins/audiobridge-deps/g722/g722_codec.h plugins/audiobridge-deps/g722/g722_common.h \
+	plugins/audiobridge-deps/g722/g722_decode.c plugins/audiobridge-deps/g722/g722_decoder.h \
+	plugins/audiobridge-deps/g722/g722_encode.c plugins/audiobridge-deps/g722/g722_encoder.h \
+	plugins/audiobridge-deps/g722/g722.h plugins/audiobridge-deps/g722/g722_private.h
 plugins_libjanus_audiobridge_la_CFLAGS = $(plugins_cflags) $(OPUS_CFLAGS) $(OGG_CFLAGS) $(RNNOISE_CFLAGS) $(LIBSRTP_CFLAGS)
 plugins_libjanus_audiobridge_la_LDFLAGS = $(plugins_ldflags) $(OPUS_LDFLAGS) $(OPUS_LIBS) $(OGG_LDFLAGS) $(OGG_LIBS) $(RNNOISE_LDFLAGS) $(RNNOISE_LIBS)
 plugins_libjanus_audiobridge_la_LIBADD = $(plugins_libadd) $(OPUS_LIBADD) $(OGG_LIBADD) $(RNNOISE_LIBADD)

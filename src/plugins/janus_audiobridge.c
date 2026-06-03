@@ -1220,6 +1220,7 @@ room-<unique room ID>: {
  * the one available out of the box comes with a nasty memory leak */
 #include "audiobridge-deps/speex/speex_jitter.h"
 #include "audiobridge-deps/speex/speex_resampler.h"
+#include "audiobridge-deps/g722/g722_codec.h"
 #ifdef HAVE_RNNOISE
 #include <rnnoise.h>
 #endif
@@ -1779,6 +1780,16 @@ typedef struct janus_audiobridge_participant {
 	gboolean stereo;		/* Whether stereo will be used for spatial audio */
 	int spatial_position;	/* Panning of this participant in the mix */
 
+	/* G.722 state */
+	G722_ENC_CTX *g722_enc;
+	G722_DEC_CTX *g722_dec;
+
+	/* encoder/decoder resampling */
+	guint32 outbound_ts;
+	guint32 resamp_ts;
+	SpeexResamplerState *enc_resampler;
+	SpeexResamplerState *dec_resampler;
+
 	/* Audio metering stuff */
 	double meter_sum;
 	unsigned int meter_samples;
@@ -1877,6 +1888,7 @@ static void janus_audiobridge_buffer_packet_destroy(janus_audiobridge_buffer_pac
 static unsigned int janus_audiobridge_participant_pt(janus_audiobridge_participant *participant);
 static unsigned int janus_audiobridge_participant_codec_rate(janus_audiobridge_participant *participant);
 static unsigned int janus_audiobridge_participant_codec_samples(janus_audiobridge_participant *participant);
+static unsigned int janus_audiobridge_participant_codec_ticks(janus_audiobridge_participant *participant);
 static void janus_audiobridge_participant_set_codec(janus_audiobridge_participant *participant, janus_audiocodec codec);
 
 static void janus_audiobridge_participant_istalking(janus_audiobridge_session *session,
@@ -1945,6 +1957,14 @@ static void janus_audiobridge_participant_free(const janus_refcount *participant
 		janus_audiobridge_participant_clear_outbuf(participant);
 		g_async_queue_unref(participant->outbuf);
 	}
+	if(participant->g722_enc)
+		g722_encoder_destroy(participant->g722_enc);
+	if(participant->g722_enc)
+		g722_decoder_destroy(participant->g722_dec);
+	if(participant->enc_resampler)
+		speex_resampler_destroy(participant->enc_resampler);
+	if(participant->dec_resampler)
+		speex_resampler_destroy(participant->dec_resampler);
 #ifdef HAVE_RNNOISE
 	if(participant->rnnoise[0])
 		rnnoise_destroy(participant->rnnoise[0]);
@@ -2410,7 +2430,7 @@ static int janus_audiobridge_create_static_rtp_forwarder(janus_config_category *
 	janus_config_item *rfcodec = janus_config_get(config, cat, janus_config_type_item, "rtp_forward_codec");
 	if(rfcodec != NULL && rfcodec->value != NULL) {
 		codec = janus_audiocodec_from_name(rfcodec->value);
-		if(codec != JANUS_AUDIOCODEC_OPUS && codec != JANUS_AUDIOCODEC_PCMA && codec != JANUS_AUDIOCODEC_PCMU) {
+		if(codec != JANUS_AUDIOCODEC_OPUS && codec != JANUS_AUDIOCODEC_PCMA && codec != JANUS_AUDIOCODEC_PCMU && codec != JANUS_AUDIOCODEC_G722) {
 			JANUS_LOG(LOG_ERR, "Unsupported codec (%s)\n", rfcodec->value);
 			return 0;
 		}
@@ -5019,7 +5039,7 @@ static json_t *janus_audiobridge_process_synchronous_request(janus_audiobridge_s
 		json_t *rfc = json_object_get(root, "codec");
 		if(rfc) {
 			codec = janus_audiocodec_from_name(json_string_value(rfc));
-			if(codec != JANUS_AUDIOCODEC_OPUS && codec != JANUS_AUDIOCODEC_PCMA && codec != JANUS_AUDIOCODEC_PCMU) {
+			if(codec != JANUS_AUDIOCODEC_OPUS && codec != JANUS_AUDIOCODEC_PCMA && codec != JANUS_AUDIOCODEC_PCMU && codec != JANUS_AUDIOCODEC_G722) {
 				JANUS_LOG(LOG_ERR, "Unsupported codec (%s)\n", json_string_value(rfc));
 				error_code = JANUS_AUDIOBRIDGE_ERROR_INVALID_ELEMENT;
 				g_snprintf(error_cause, 512, "Unsupported codec (%s)", json_string_value(rfc));
@@ -6435,8 +6455,9 @@ void janus_audiobridge_incoming_rtp(janus_plugin_session *handle, janus_plugin_r
 			JitterBufferPacket jbp = {0};
 			jbp.data = (char *)pkt;
 			jbp.len = 0;
-			jbp.span = janus_audiobridge_participant_codec_samples(participant);
-			jbp.timestamp = (uint32_t)ntohs(rtp->seq_number) * jbp.span;
+			jbp.span = janus_audiobridge_participant_codec_ticks(participant);
+			jbp.timestamp = participant->outbound_ts;
+			participant->outbound_ts += jbp.span;
 			jitter_buffer_put(participant->jitter, &jbp);
 			janus_mutex_unlock(&participant->qmutex);
 		}
@@ -6894,13 +6915,13 @@ static void *janus_audiobridge_handler(void *data) {
 			janus_audiocodec codec = JANUS_AUDIOCODEC_OPUS;
 			if(acodec != NULL) {
 				codec = janus_audiocodec_from_name(json_string_value(acodec));
-				if(codec != JANUS_AUDIOCODEC_OPUS && codec != JANUS_AUDIOCODEC_PCMA && codec != JANUS_AUDIOCODEC_PCMU) {
+				if(codec != JANUS_AUDIOCODEC_OPUS && codec != JANUS_AUDIOCODEC_PCMA && codec != JANUS_AUDIOCODEC_PCMU && codec != JANUS_AUDIOCODEC_G722) {
 					janus_mutex_unlock(&audiobridge->mutex);
 					janus_refcount_decrease(&audiobridge->ref);
 					janus_mutex_unlock(&sessions_mutex);
-					JANUS_LOG(LOG_ERR, "Invalid element (codec must opus, pcmu or pcma)\n");
+					JANUS_LOG(LOG_ERR, "Invalid element (codec must opus, g722, pcmu or pcma)\n");
 					error_code = JANUS_AUDIOBRIDGE_ERROR_INVALID_ELEMENT;
-					g_snprintf(error_cause, 512, "Invalid element (codec must opus, pcmu or pcma)");
+					g_snprintf(error_cause, 512, "Invalid element (codec must opus, g722, pcmu or pcma)");
 					goto error;
 				}
 			}
@@ -6960,6 +6981,7 @@ static void *janus_audiobridge_handler(void *data) {
 				participant = g_malloc0(sizeof(janus_audiobridge_participant));
 				janus_refcount_init(&participant->ref, janus_audiobridge_participant_free);
 				g_atomic_int_set(&participant->active, 0);
+				participant->room = audiobridge;
 				janus_audiobridge_participant_set_codec(participant, codec);
 				participant->display = NULL;
 				/* Disable automatic adjustment */
@@ -7023,6 +7045,11 @@ static void *janus_audiobridge_handler(void *data) {
 				participant->dBov_level = 0;
 				participant->talking = FALSE;
 			}
+			participant->g722_enc = g722_encoder_new(64000, 0);
+			participant->g722_dec = g722_decoder_new(64000, 0);
+			participant->resamp_ts = 0;
+			participant->outbound_ts = 0;
+
 			JANUS_LOG(LOG_VERB, "Creating Opus encoder/decoder (sampling rate %d)\n", audiobridge->sampling_rate);
 			/* Opus encoder */
 			int error = 0;
@@ -8280,7 +8307,9 @@ static void *janus_audiobridge_handler(void *data) {
 					}
 					JANUS_LOG(LOG_VERB, "Opus payload type is %d, outgoing FEC %s\n", participant->opus_pt, participant->fec ? "enabled" : "disabled");
 				} else {
-					pt = janus_sdp_get_codec_pt(sdp, -1, "pcmu");
+					pt = janus_sdp_get_codec_pt(sdp, -1, "g722");
+					if (pt < 0)
+						pt = janus_sdp_get_codec_pt(sdp, -1, "pcmu");
 					if (pt < 0)
 						pt = janus_sdp_get_codec_pt(sdp, -1, "pcma");
 					if (pt >= 0) {
@@ -8740,17 +8769,21 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 			janus_audiobridge_rtp_relay_packet *pkt = (janus_audiobridge_rtp_relay_packet *)(peek ? peek->data : NULL);
 			if(pkt != NULL && !pkt->silence) {
 				unsigned int rate = janus_audiobridge_participant_codec_rate(p);
-				unsigned int num_samples = janus_audiobridge_participant_codec_samples(p);
 				if(audiobridge->sampling_rate != rate) {
 					/* Upsample this to whatever the mixer needs */
-					pkt->length = janus_audiobridge_resample((opus_int16 *)pkt->data, num_samples, rate, resampled, audiobridge->sampling_rate);
-					if(pkt->length == 0) {
-						JANUS_LOG(LOG_WARN, "[G.711] Error upsampling to %d, skipping audio packet\n", audiobridge->sampling_rate);
+					spx_uint32_t in_len = pkt->length;
+					spx_uint32_t out_len = samples;
+					int err = -1;
+					if (p->dec_resampler)
+						err = speex_resampler_process_int(p->dec_resampler, 0, (spx_int16_t *)pkt->data, &in_len, (spx_int16_t *)resampled, &out_len);
+					if (err != 0) {
+						JANUS_LOG(LOG_WARN, "Error upsampling, skipping audio packet\n");
 						janus_mutex_unlock(&p->qmutex);
 						ps = ps->next;
 						continue;
 					}
-					memcpy(pkt->data, resampled, pkt->length*2);
+					memcpy(pkt->data, resampled, out_len*2);
+					pkt->length = out_len;
 				}
 				curBuffer = (opus_int16 *)pkt->data;
 				if(groups_num == 0) {
@@ -9029,21 +9062,30 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 			unsigned int rate = janus_audiobridge_participant_codec_rate(p);
 			if(audiobridge->sampling_rate != rate) {
 				/* Downsample this from whatever the mixer uses */
-				i = janus_audiobridge_resample(outBuffer, samples, audiobridge->sampling_rate, (int16_t *)mixedpkt->data, rate);
-				if(i == 0) {
-					JANUS_LOG(LOG_WARN, "[G.711] Error downsampling from %d, skipping audio packet\n", audiobridge->sampling_rate);
+				int resamp_samples = janus_audiobridge_participant_codec_samples(p);
+				int resamp_ticks = janus_audiobridge_participant_codec_ticks(p);
+				spx_uint32_t in_len = samples;
+				spx_uint32_t out_len = resamp_samples;
+				int err = -1;
+				if (p->enc_resampler)
+					err = speex_resampler_process_int(p->enc_resampler, 0, (spx_int16_t *)outBuffer, &in_len, (spx_int16_t *)mixedpkt->data, &out_len);
+				if (err != 0) {
+					JANUS_LOG(LOG_WARN, "Error downsampling, skipping audio packet\n");
 					g_free(mixedpkt->data);
 					g_free(mixedpkt);
 					janus_refcount_decrease(&p->ref);
 					ps = ps->next;
 					continue;
 				}
+				mixedpkt->length = out_len;
+				mixedpkt->timestamp = p->resamp_ts;
+				p->resamp_ts += resamp_ticks;
 			} else {
 				/* Just copy */
 				memcpy(mixedpkt->data, outBuffer, samples*2);
+				mixedpkt->length = samples;	/* We set the number of samples here, not the data length */
+				mixedpkt->timestamp = ts;
 			}
-			mixedpkt->length = samples;	/* We set the number of samples here, not the data length */
-			mixedpkt->timestamp = ts;
 			mixedpkt->seq_number = seq;
 			mixedpkt->ssrc = audiobridge->room_ssrc;
 			mixedpkt->silence = FALSE;
@@ -9255,8 +9297,8 @@ static void *janus_audiobridge_participant_thread(void *data) {
 			before += 20000;
 			if(participant->jitter) {
 				janus_mutex_lock(&participant->qmutex);
-				unsigned int samples = janus_audiobridge_participant_codec_samples(participant);
-				ret = jitter_buffer_get(participant->jitter, &jbp, samples, NULL);
+				unsigned int ticks = janus_audiobridge_participant_codec_ticks(participant);
+				ret = jitter_buffer_get(participant->jitter, &jbp, ticks, NULL);
 				jitter_ticks++;
 				/* Adjust the buffer size every 50 ticks (~1 second) */
 				if(jitter_ticks == JITTER_BUFFER_MAX_PACKETS) {
@@ -9378,6 +9420,17 @@ static void *janus_audiobridge_participant_thread(void *data) {
 							for(i=0; i<plen; i++)
 								*(samples+i) = janus_audiobridge_g711_alaw_dectable[*(payload+i)];
 						}
+						pkt->length = 160;
+					} else if(participant->codec == JANUS_AUDIOCODEC_G722 && participant->g722_dec) {
+						/* G.722 */
+						if(plen != 160) {
+							JANUS_LOG(LOG_WARN, "[G.722] Wrong packet size (expected 160, got %d), skipping audio packet\n", plen);
+							janus_audiobridge_buffer_packet_destroy(bpkt);
+							g_free(pkt->data);
+							g_free(pkt);
+							continue;
+						}
+						g722_decode(participant->g722_dec, (const uint8_t*)payload, 160, (int16_t*)pkt->data);
 						pkt->length = 320;
 					}
 #ifdef HAVE_RNNOISE
@@ -9397,7 +9450,7 @@ static void *janus_audiobridge_participant_thread(void *data) {
 						if(participant->codec == JANUS_AUDIOCODEC_OPUS) {
 							JANUS_LOG(LOG_ERR, "[Opus] Ops! got an error decoding the Opus frame: %d (%s)\n", pkt->length, opus_strerror(pkt->length));
 						} else {
-							JANUS_LOG(LOG_ERR, "[G.711] Ops! got an error decoding the audio frame\n");
+							JANUS_LOG(LOG_ERR, "[G.711/G.722] Ops! got an error decoding the audio frame\n");
 						}
 						g_free(pkt->data);
 						g_free(pkt);
@@ -9441,11 +9494,26 @@ static void *janus_audiobridge_participant_thread(void *data) {
 				outpkt->data->version = 2;
 				outpkt->data->markerbit = 0;	/* FIXME Should be 1 for the first packet */
 				outpkt->data->seq_number = htons(mixedpkt->seq_number);
-				outpkt->data->timestamp = htonl(mixedpkt->timestamp/6);
+				outpkt->data->timestamp = htonl(mixedpkt->timestamp);
 				outpkt->data->ssrc = htonl(mixedpkt->ssrc);	/* The Janus core will fix this anyway */
 				/* Backup the actual timestamp and sequence number set by the audiobridge, in case a room is changed */
 				outpkt->ssrc = mixedpkt->ssrc;
-				outpkt->timestamp = mixedpkt->timestamp/6;
+				outpkt->timestamp = mixedpkt->timestamp;
+				outpkt->seq_number = mixedpkt->seq_number;
+				janus_audiobridge_relay_rtp_packet(participant->session, outpkt);
+			} else if(g_atomic_int_get(&participant->active) && participant->codec == JANUS_AUDIOCODEC_G722) {
+				/* Encode using G.722 */
+				g722_encode(participant->g722_enc, (const int16_t*)mixedpkt->data, 320, (uint8_t*)payload+12);
+				outpkt->length = 172;	/* Take the RTP header into consideration */
+				/* Update RTP header */
+				outpkt->data->version = 2;
+				outpkt->data->markerbit = 0;	/* FIXME Should be 1 for the first packet */
+				outpkt->data->seq_number = htons(mixedpkt->seq_number);
+				outpkt->data->timestamp = htonl(mixedpkt->timestamp);
+				outpkt->data->ssrc = htonl(mixedpkt->ssrc);	/* The Janus core will fix this anyway */
+				/* Backup the actual timestamp and sequence number set by the audiobridge, in case a room is changed */
+				outpkt->ssrc = mixedpkt->ssrc;
+				outpkt->timestamp = mixedpkt->timestamp;
 				outpkt->seq_number = mixedpkt->seq_number;
 				janus_audiobridge_relay_rtp_packet(participant->session, outpkt);
 			} else if(g_atomic_int_get(&participant->active)) {
@@ -9511,10 +9579,7 @@ static void janus_audiobridge_relay_rtp_packet(gpointer data, gpointer user_data
 	}
 	janus_audiobridge_participant *participant = session->participant;
 	/* Set the payload type */
-	if(participant->codec == JANUS_AUDIOCODEC_OPUS)
-		packet->data->type = participant->opus_pt;
-	else
-		packet->data->type = (participant->codec == JANUS_AUDIOCODEC_PCMA ? 8 : 0);
+	packet->data->type = janus_audiobridge_participant_pt(participant);
 	/* Fix sequence number and timestamp (room switching may be involved) */
 	janus_rtp_header_update(packet->data, &participant->context, FALSE, 0);
 	if(participant->plainrtp_media.audio_rtp_fd > 0) {
@@ -9760,6 +9825,8 @@ static unsigned int janus_audiobridge_participant_pt(janus_audiobridge_participa
 		return 0;
 	case JANUS_AUDIOCODEC_PCMA:
 		return 8;
+	case JANUS_AUDIOCODEC_G722:
+		return 9;
 	default:
 	}
 	return participant->opus_pt;
@@ -9775,9 +9842,27 @@ static unsigned int janus_audiobridge_participant_codec_rate(janus_audiobridge_p
 	case JANUS_AUDIOCODEC_PCMU:
 	case JANUS_AUDIOCODEC_PCMA:
 		return 8000;
+	case JANUS_AUDIOCODEC_G722:
+		return 16000;
 	default:
 	}
 	return participant->sampling_rate;
+}
+
+static unsigned int janus_audiobridge_participant_codec_ticks(janus_audiobridge_participant *participant) {
+	if(participant == NULL)
+		return 0;
+
+	switch(participant->codec) {
+	case JANUS_AUDIOCODEC_OPUS:
+		return 960;
+	case JANUS_AUDIOCODEC_PCMU:
+	case JANUS_AUDIOCODEC_PCMA:
+	case JANUS_AUDIOCODEC_G722:
+		return 160;
+	default:
+	}
+	return 960;
 }
 
 static unsigned int janus_audiobridge_participant_codec_samples(janus_audiobridge_participant *participant) {
@@ -9790,6 +9875,8 @@ static unsigned int janus_audiobridge_participant_codec_samples(janus_audiobridg
 	case JANUS_AUDIOCODEC_PCMU:
 	case JANUS_AUDIOCODEC_PCMA:
 		return 160;
+	case JANUS_AUDIOCODEC_G722:
+		return 320;
 	default:
 	}
 	return 960;
@@ -9799,9 +9886,26 @@ static void janus_audiobridge_participant_set_codec(janus_audiobridge_participan
 	if(participant == NULL)
 		return;
 
+        /* destroy existing object */
+	if(participant->enc_resampler)
+		speex_resampler_destroy(participant->enc_resampler);
+	participant->enc_resampler = NULL;
+	if(participant->dec_resampler)
+		speex_resampler_destroy(participant->dec_resampler);
+	participant->dec_resampler = NULL;
+
+	participant->codec = codec;
+	if(participant->room) {
+		unsigned int codec_rate = janus_audiobridge_participant_codec_rate(participant);
+		unsigned int room_rate = participant->room->sampling_rate;
+		if(room_rate != codec_rate) {
+			int quality = 8, error = 0;
+			participant->enc_resampler = speex_resampler_init(1, room_rate, codec_rate, quality, &error);
+			participant->dec_resampler = speex_resampler_init(1, codec_rate, room_rate, quality, &error);
+		}
+	}
 	unsigned int samples = janus_audiobridge_participant_codec_samples(participant);
 	janus_mutex_lock(&participant->qmutex);
-	participant->codec = codec;
 	if(participant->jitter == NULL) {
 		participant->jitter = jitter_buffer_init(samples);
 		jitter_buffer_ctl(participant->jitter, JITTER_BUFFER_SET_DESTROY_CALLBACK, &janus_audiobridge_buffer_packet_destroy);
