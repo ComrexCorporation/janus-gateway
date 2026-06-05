@@ -1398,6 +1398,7 @@ janus_sdp *janus_sdp_generate_offer(const char *name, const char *address, ...) 
 						JANUS_SDP_OA_MLINE, JANUS_SDP_AUDIO,
 						JANUS_SDP_OA_MID, mid,
 						JANUS_SDP_OA_MSID, msid, mstid,
+						JANUS_SDP_OA_PT, pt,
 						JANUS_SDP_OA_OPUSRED_PT, opusred_pt,
 						JANUS_SDP_OA_CODEC, codec,
 						JANUS_SDP_OA_DIRECTION, mdir,
