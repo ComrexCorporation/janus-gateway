@@ -9980,7 +9980,7 @@ static void janus_audiobridge_meter_audio(janus_audiobridge_participant *partici
 	participant->meter_samples += num_samples;
 
 	// once the metering interval has expired, emit events
-	if (participant->meter_samples >= audiobridge->meter_interval) {
+	if (participant->meter_samples >= audiobridge->meter_interval * participant->sampling_rate / audiobridge->sampling_rate) {
 		double rms = sqrt(participant->meter_sum / participant->meter_samples);
 		double dbfs = rms == 0 ? -100 : log10(rms) * 20;
 		participant->meter_samples = 0;
