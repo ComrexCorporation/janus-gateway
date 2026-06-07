@@ -1815,6 +1815,7 @@ typedef struct janus_audiobridge_participant {
 	GAsyncQueue *outbuf;	/* Mixed audio to send to this participant */
 	janus_mutex qmutex;		/* Incoming queue mutex */
 	int pt;			/* Incoming payload type */
+	int out_pt;		/* Outgoing payload type */
 	int extmap_id;			/* Audio level RTP extension id, if any */
 	int dBov_level;			/* Value in dBov of the audio level (last value from extension) */
 	int audio_active_packets;	/* Participant's number of audio packets to accumulate */
@@ -8229,7 +8230,7 @@ static void *janus_audiobridge_handler(void *data) {
 			if(sdp != NULL) {
 				int pt = janus_sdp_get_codec_pt(sdp, -1, "opus");
 				if (pt > 0) {
-					participant->pt = pt;
+					participant->out_pt = pt;
 					janus_audiobridge_participant_set_codec(participant, JANUS_AUDIOCODEC_OPUS);
 					if(strstr(msg_sdp, "useinbandfec=1")){
 						/* Opus codec, inband FEC (from Janus to user) set */
@@ -8249,6 +8250,7 @@ static void *janus_audiobridge_handler(void *data) {
 					if (pt >= 0) {
 						const char* codec_name = janus_sdp_get_codec_name(sdp, -1, pt);
 						janus_audiobridge_participant_set_codec(participant, janus_audiocodec_from_name(codec_name));
+						participant->out_pt = pt;
 					}
 				}
 			}
@@ -8306,6 +8308,7 @@ static void *janus_audiobridge_handler(void *data) {
 			/* If we got an offer, we need to answer */
 			janus_sdp *offer = NULL, *answer = NULL;
 			if(got_offer) {
+				participant->pt = participant->out_pt;
 				answer = janus_sdp_generate_answer(sdp);
 				/* Only accept the first audio line, and reject everything else if offered */
 				GList *temp = sdp->m_lines;
@@ -9513,7 +9516,7 @@ static void janus_audiobridge_relay_rtp_packet(gpointer data, gpointer user_data
 	}
 	janus_audiobridge_participant *participant = session->participant;
 	/* Set the payload type */
-	packet->data->type = participant->pt;
+	packet->data->type = participant->out_pt;
 	/* Fix sequence number and timestamp (room switching may be involved) */
 	janus_rtp_header_update(packet->data, &participant->context, FALSE, 0);
 	if(participant->plainrtp_media.audio_rtp_fd > 0) {
@@ -9809,6 +9812,7 @@ static int janus_audiobridge_participant_set_codec(janus_audiobridge_participant
 		JANUS_LOG(LOG_VERB, "Creating Opus encoder/decoder (sampling rate %d)\n", audiobridge->sampling_rate);
 		/* Opus encoder */
 		int error = 0;
+		participant->pt = 111;
 		janus_mutex_lock(&participant->encoding_mutex);
 		if(participant->encoder == NULL) {
 			participant->sampling_rate = audiobridge->sampling_rate;
