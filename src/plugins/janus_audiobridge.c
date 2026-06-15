@@ -907,6 +907,7 @@ room-<unique room ID>: {
 	"audio_level_average" : "<if provided, overrides the room audio_level_average for this user; optional>",
 	"audio_active_packets" : "<if provided, overrides the room audio_active_packets for this user; optional>",
 	"meter_events" : "<true|false, whether to report audio levels for all participants in regular events>",
+	"send_meter_events" : "<true|false, whether to report send audio levels for all participants in regular events>",
 	"record": <true|false, whether to record this user's contribution to a .mjr file (mixer not involved)>,
 	"filename": "<basename of the file to record to, -audio.mjr will be added by the plugin; will be relative to mjrs_dir, if configured in the room>"
 }
@@ -1414,6 +1415,7 @@ static struct janus_json_parameter join_parameters[] = {
 	{"filename", JSON_STRING, 0},
 	{"generate_offer", JANUS_JSON_BOOL, 0},
 	{"meter_events", JANUS_JSON_BOOL, 0},
+	{"send_meter_events", JANUS_JSON_BOOL, 0},
 	{"rtp", JSON_OBJECT, 0},
 	{"secret", JSON_STRING, 0}
 };
@@ -1796,6 +1798,9 @@ typedef struct janus_audiobridge_participant {
 	double meter_sum;
 	unsigned int meter_samples;
 	gboolean meter_events;
+	double send_meter_sum;
+	unsigned int send_meter_samples;
+	gboolean send_meter_events;
 #ifdef HAVE_RNNOISE
 #define DENOISER_FRAME_SIZE 480
 	gboolean denoise;					/* Whether we should denoise this participant */
@@ -2005,7 +2010,8 @@ static void janus_audiobridge_participant_upsample(janus_audiobridge_participant
 static void janus_audiobridge_participant_downsample(janus_audiobridge_participant *participant, opus_int16 *input, int *in_len, opus_int16 *output, int *out_len);
 #endif
 
-static void janus_audiobridge_meter_audio(janus_audiobridge_participant *participant, char *data, int len);
+static void janus_audiobridge_meter_recv_audio(janus_audiobridge_participant *participant, char *data, int len);
+static void janus_audiobridge_meter_send_audio(janus_audiobridge_participant *participant, char *data, int len);
 
 static void janus_audiobridge_session_destroy(janus_audiobridge_session *session) {
 	if(session && g_atomic_int_compare_and_exchange(&session->destroyed, 0, 1))
@@ -6880,6 +6886,7 @@ static void *janus_audiobridge_handler(void *data) {
 			json_t *recfile = json_object_get(root, "filename");
 			json_t *gen_offer = json_object_get(root, "generate_offer");
 			json_t *meter_events = json_object_get(root, "meter_events");
+			json_t *send_meter_events = json_object_get(root, "send_meter_events");
 			int volume = gain ? json_integer_value(gain) : 100;
 			int spatial_position = spatial ? json_integer_value(spatial) : 50;
 			int32_t opus_bitrate = audiobridge->default_bitrate;
@@ -7008,6 +7015,7 @@ static void *janus_audiobridge_handler(void *data) {
 			participant->display = display_text ? g_strdup(display_text) : NULL;
 			participant->muted = muted ? json_is_true(muted) : FALSE;	/* By default, everyone's unmuted when joining */
 			participant->meter_events = meter_events ? json_is_true(meter_events) : FALSE;
+			participant->send_meter_events = send_meter_events ? json_is_true(send_meter_events) : FALSE;
 			if(suspended && json_is_true(suspended)) {
 				janus_mutex_lock(&participant->suspend_cond_mutex);
 				g_atomic_int_set(&participant->suspended, 1);
@@ -9271,7 +9279,7 @@ static void *janus_audiobridge_participant_thread(void *data) {
 							janus_audiobridge_participant_denoise(participant, (char *)pkt->data, pkt->length);
 #endif
 						/* Perform metering on the decoded audio */
-						janus_audiobridge_meter_audio(participant, (char*)pkt->data, pkt->length);
+						janus_audiobridge_meter_recv_audio(participant, (char*)pkt->data, pkt->length);
 
 						/* Update the details */
 						participant->last_seq = pkt->seq_number;
@@ -9373,7 +9381,7 @@ static void *janus_audiobridge_participant_thread(void *data) {
 						janus_audiobridge_participant_denoise(participant, (char *)pkt->data, pkt->length);
 #endif
 					/* Perform metering on the decoded audio */
-					janus_audiobridge_meter_audio(participant, (char*)pkt->data, pkt->length);
+					janus_audiobridge_meter_recv_audio(participant, (char*)pkt->data, pkt->length);
 
 					/* Get rid of the buffered packet */
 					janus_audiobridge_buffer_packet_destroy(bpkt);
@@ -9406,6 +9414,11 @@ static void *janus_audiobridge_participant_thread(void *data) {
 		/* Now check if there's packets to encode */
 		mixedpkt = g_async_queue_try_pop(participant->outbuf);
 		if(mixedpkt != NULL && g_atomic_int_get(&session->destroyed) == 0 && g_atomic_int_get(&session->started)) {
+
+			/* Perform metering on the mixed audio */
+			if(g_atomic_int_get(&participant->active))
+				janus_audiobridge_meter_send_audio(participant, (char*)mixedpkt->data, mixedpkt->length);
+
 			if(g_atomic_int_get(&participant->active) && (participant->codec == JANUS_AUDIOCODEC_PCMA ||
 					participant->codec == JANUS_AUDIOCODEC_PCMU)) {
 				/* Encode using G.711 */
@@ -9961,12 +9974,7 @@ static void janus_audiobridge_participant_istalking(janus_audiobridge_session *s
 	}
 }
 
-static void janus_audiobridge_meter_audio(janus_audiobridge_participant *participant, char *data, int len) {
-	if(len < 0 || data == NULL || participant == NULL || participant->room == NULL)
-		return;
-	janus_audiobridge_room *audiobridge = participant->room;
-	if (audiobridge->meter_interval == 0)
-		return;
+static void janus_audiobridge_meter_audio(janus_audiobridge_participant *participant, janus_audiobridge_room *audiobridge, char *data, int len, double* meter_sum, unsigned int* meter_samples, int send) {
 
 	// accumulate audio samples
 	opus_int16 *samples = (opus_int16 *)data;
@@ -9976,20 +9984,21 @@ static void janus_audiobridge_meter_audio(janus_audiobridge_participant *partici
 		double sample = (double)samples[i] / (1<<15);
 		sum += (sample * sample);
 	}
-	participant->meter_sum += sum;
-	participant->meter_samples += num_samples;
+	*meter_sum += sum;
+	*meter_samples += num_samples;
 
 	// once the metering interval has expired, emit events
-	if (participant->meter_samples >= audiobridge->meter_interval * participant->sampling_rate / audiobridge->sampling_rate) {
-		double rms = sqrt(participant->meter_sum / participant->meter_samples);
+	if (*meter_samples >= audiobridge->meter_interval * participant->sampling_rate / audiobridge->sampling_rate) {
+		double rms = sqrt(*meter_sum / *meter_samples);
 		double dbfs = rms == 0 ? -100 : log10(rms) * 20;
-		participant->meter_samples = 0;
-		participant->meter_sum = 0;
+		*meter_samples = 0;
+		*meter_sum = 0;
 
 		janus_mutex_lock(&audiobridge->mutex);
 		json_t *event = json_object();
 		json_object_set_new(event, "audiobridge", json_string("level"));
 		json_object_set_new(event, "level", json_integer(dbfs));;
+		json_object_set_new(event, "send", json_boolean(send));
 		json_object_set_new(event, "room",
 				    string_ids ? json_string(audiobridge->room_id_str) : json_integer(audiobridge->room_id));
 		json_object_set_new(event, "id",
@@ -10007,6 +10016,26 @@ static void janus_audiobridge_meter_audio(janus_audiobridge_participant *partici
 		json_decref(event);
 		janus_mutex_unlock(&audiobridge->mutex);
 	}
+}
+
+static void janus_audiobridge_meter_send_audio(janus_audiobridge_participant *participant, char *data, int len) {
+	if(len < 0 || data == NULL || participant == NULL || participant->room == NULL)
+		return;
+	janus_audiobridge_room *room = participant->room;
+	if (room->meter_interval == 0 || !participant->send_meter_events)
+		return;
+
+	janus_audiobridge_meter_audio(participant, room, data, len, &participant->send_meter_sum, &participant->send_meter_samples, 1);
+}
+
+static void janus_audiobridge_meter_recv_audio(janus_audiobridge_participant *participant, char *data, int len) {
+	if(len < 0 || data == NULL || participant == NULL || participant->room == NULL)
+		return;
+	janus_audiobridge_room *room = participant->room;
+	if (room->meter_interval == 0)
+		return;
+
+	janus_audiobridge_meter_audio(participant, room, data, len, &participant->meter_sum, &participant->meter_samples, 0);
 }
 
 #ifdef HAVE_RNNOISE
